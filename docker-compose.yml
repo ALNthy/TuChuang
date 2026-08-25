@@ -1,0 +1,39 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: tuchuang-backend
+    ports:
+      - "5000:5000"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ConnectionStrings__Default=Data Source=/app/data/tuchuang.db
+      - Jwt__SigningKey=${JWT_SIGNING_KEY:-tuchuang-dev-signing-key-please-change-to-long-random-in-prod-1234567890}
+      - AdminCredentials__Username=${ADMIN_USER:-admin}
+      - AdminCredentials__Password=${ADMIN_PASSWORD:-admin123}
+    volumes:
+      - tuchuang-db:/app/data
+      - tuchuang-uploads:/app/uploads
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5000/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: tuchuang-frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  tuchuang-db:
+  tuchuang-uploads:

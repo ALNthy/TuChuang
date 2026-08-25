@@ -1,0 +1,30 @@
+# 运行时产生的日志与 PID
+logs/
+*.log
+*.pid
+
+# 环境变量文件（可能含密钥）
+.env
+
+# 系统/IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vs/
+.vscode/
+*.user
+*.suo
+
+# 构建产物（与子目录 .gitignore 重复，但根目录统一管理更稳）
+backend/bin/
+backend/obj/
+backend/publish/
+backend/uploads/
+backend/preview-cache/
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+tests/TuchuangApi.Tests/

@@ -1,0 +1,29 @@
+# ===== 构建产物 =====
+**/bin
+**/obj
+backend/publish
+frontend/dist
+frontend/.vite
+
+# ===== 依赖 =====
+**/node_modules
+
+# ===== IDE / 系统 =====
+.git
+.vs
+.vscode
+.idea
+*.user
+*.suo
+
+# ===== 日志 & 运行时数据 =====
+**/*.log
+backend/uploads/*
+backend/preview-cache/*
+backend/data/*
+backend/tuchuang.db
+backend/tuchuang.db-shm
+backend/tuchuang.db-wal
+
+# ===== 文档 =====
+*.md
