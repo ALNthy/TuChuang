@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using ImageMagick;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -28,9 +29,13 @@ public class ImagesController : ControllerBase
     };
 
     private const long MaxFileSize = 100 * 1024 * 1024; // 100MB
+    private const int MaxChunks = 200;              // 分片数量上限（100MB / 5MB = 20 片，留足余量）
     private const int ThumbMaxWidth = 480;     // 卡片缩略图宽度
     private const int MediumMaxWidth = 1600;   // Lightbox 中等预览宽度（RAW 用）
     private const int ThumbQuality = 80;
+
+    // 缩略图写锁：按缓存文件路径加锁，避免同一图片并发请求重复转码/同时写文件
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> PreviewLocks = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly AppDbContext _db;
     private readonly IWebHostEnvironment _env;
@@ -74,7 +79,7 @@ public class ImagesController : ControllerBase
         var items = await q
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
-            .Select(i => new ImageDto(i.Id, i.FileName, i.FileSize, i.ContentType, i.Category, i.UploadedAt))
+            .Select(i => new ImageDto(i.Id, i.FileName, i.FileSize, i.ContentType, i.Category, i.UploadedAt, i.StoredName))
             .ToListAsync();
         var hasMore = page * pageSize < total;
         return Ok(new { items, total, hasMore, page, pageSize });
@@ -133,7 +138,7 @@ public class ImagesController : ControllerBase
             _db.Images.Add(image);
             await _db.SaveChangesAsync();
 
-            created.Add(new ImageDto(image.Id, image.FileName, image.FileSize, image.ContentType, image.Category, image.UploadedAt));
+            created.Add(new ImageDto(image.Id, image.FileName, image.FileSize, image.ContentType, image.Category, image.UploadedAt, image.StoredName));
         }
 
         return Ok(created);
@@ -155,8 +160,8 @@ public class ImagesController : ControllerBase
     {
         if (file is null || file.Length == 0)
             return BadRequest(new { error = "分片数据为空" });
-        if (string.IsNullOrWhiteSpace(uploadId))
-            return BadRequest(new { error = "uploadId 不能为空" });
+        if (!IsValidUploadId(uploadId))
+            return BadRequest(new { error = "uploadId 格式无效" });
         if (chunkIndex < 0 || chunkIndex >= totalChunks)
             return BadRequest(new { error = "分片序号无效" });
 
@@ -183,8 +188,8 @@ public class ImagesController : ControllerBase
         [FromForm] string fileName,
         [FromForm] string? category)
     {
-        if (string.IsNullOrWhiteSpace(uploadId))
-            return BadRequest(new { error = "uploadId 不能为空" });
+        if (!IsValidUploadId(uploadId))
+            return BadRequest(new { error = "uploadId 格式无效" });
 
         var sessionDir = Path.Combine(_tempDir, uploadId);
         if (!System.IO.Directory.Exists(sessionDir))
@@ -194,6 +199,27 @@ public class ImagesController : ControllerBase
             .OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToList();
         if (chunks.Count == 0)
             return BadRequest(new { error = "没有找到分片数据" });
+
+        // 校验分片完整性：解析 chunk 序号，确保从 0 连续到 N-1，缺片则拒绝合并
+        var chunkIndices = new List<int>();
+        long totalBytes = 0;
+        foreach (var chunk in chunks)
+        {
+            var name = Path.GetFileNameWithoutExtension(chunk);
+            var idxStr = name.StartsWith("chunk_", StringComparison.Ordinal) ? name["chunk_".Length..] : string.Empty;
+            if (!int.TryParse(idxStr, out var idx))
+                return BadRequest(new { error = "存在无效的分片文件" });
+            chunkIndices.Add(idx);
+            totalBytes += new System.IO.FileInfo(chunk).Length;
+        }
+        chunkIndices.Sort();
+        if (chunkIndices.Count == 0 || chunkIndices[0] != 0 || chunkIndices[^1] != chunkIndices.Count - 1)
+            return BadRequest(new { error = "分片不完整，存在缺失的分片" });
+        if (chunkIndices.Count > MaxChunks)
+            return BadRequest(new { error = $"分片数量超过上限 {MaxChunks}" });
+        // 合并前校验总大小，避免先写盘再发现超限
+        if (totalBytes > MaxFileSize)
+            return BadRequest(new { error = $"合并后文件超过 {MaxFileSize / (1024 * 1024)}MB 限制" });
 
         var ext = Path.GetExtension(fileName);
         if (!AllowedExtensions.Contains(ext))
@@ -242,7 +268,7 @@ public class ImagesController : ControllerBase
         _db.Images.Add(image);
         await _db.SaveChangesAsync();
 
-        return Ok(new ImageDto(image.Id, image.FileName, image.FileSize, image.ContentType, image.Category, image.UploadedAt));
+        return Ok(new ImageDto(image.Id, image.FileName, image.FileSize, image.ContentType, image.Category, image.UploadedAt, image.StoredName));
     }
 
     /// <summary>获取缩略图 / 预览图：
@@ -272,22 +298,48 @@ public class ImagesController : ControllerBase
         var failMark = cacheFile + ".fail";
         var sourceMtime = System.IO.File.GetLastWriteTimeUtc(sourcePath);
 
-        // 负缓存：转码失败过且源文件没变动，25 分钟内不重试
-        if (System.IO.File.Exists(failMark)
-            && System.IO.File.GetLastWriteTimeUtc(failMark) >= sourceMtime
-            && (DateTime.UtcNow - System.IO.File.GetLastWriteTimeUtc(failMark)).TotalMinutes <= 25)
-        {
-            return StatusCode(StatusCodes.Status500InternalServerError,
-                new { error = "预览生成失败（负缓存，稍后重试）" });
-        }
-
-        // 缓存有效 → 直接返回
+        // 快速路径：缓存有效直接返回（无锁，减少锁竞争）
         if (System.IO.File.Exists(cacheFile) && System.IO.File.GetLastWriteTimeUtc(cacheFile) >= sourceMtime)
         {
             return PhysicalFile(cacheFile, "image/jpeg", true);
         }
 
-        // 生成缩略图
+        // 同一缓存文件并发请求加锁，避免重复转码 + Windows 下同时写文件触发占用异常
+        var gate = PreviewLocks.GetOrAdd(cacheFile, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            // 双检：拿到锁后其他请求可能已完成生成
+            if (System.IO.File.Exists(cacheFile) && System.IO.File.GetLastWriteTimeUtc(cacheFile) >= sourceMtime)
+            {
+                return PhysicalFile(cacheFile, "image/jpeg", true);
+            }
+
+            // 负缓存：转码失败过且源文件没变动，25 分钟内不重试
+            if (System.IO.File.Exists(failMark)
+                && System.IO.File.GetLastWriteTimeUtc(failMark) >= sourceMtime
+                && (DateTime.UtcNow - System.IO.File.GetLastWriteTimeUtc(failMark)).TotalMinutes <= 25)
+            {
+                return StatusCode(StatusCodes.Status500InternalServerError,
+                    new { error = "预览生成失败（负缓存，稍后重试）" });
+            }
+
+            var err = await TryGeneratePreview(sourcePath, ext, cacheFile, failMark, targetWidth, ct);
+            if (err is null)
+                return PhysicalFile(cacheFile, "image/jpeg", true);
+
+            return StatusCode(StatusCodes.Status500InternalServerError, new { error = err });
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    /// <summary>生成并写入缩略图；返回 null 表示成功，否则返回错误信息（失败时写负缓存标记）</summary>
+    private async Task<string?> TryGeneratePreview(
+        string sourcePath, string ext, string cacheFile, string failMark, int targetWidth, CancellationToken ct)
+    {
         try
         {
             MagickImage? magick = null;
@@ -328,8 +380,7 @@ public class ImagesController : ControllerBase
             if (magick is null)
             {
                 try { System.IO.File.WriteAllText(failMark, lastErr?.Message ?? "无法解码"); } catch { /* ignore */ }
-                return StatusCode(StatusCodes.Status500InternalServerError,
-                    new { error = $"生成预览失败：{lastErr?.Message ?? "无法解码该文件"}" });
+                return $"生成预览失败：{lastErr?.Message ?? "无法解码该文件"}";
             }
 
             using (magick)
@@ -342,26 +393,28 @@ public class ImagesController : ControllerBase
                 }
                 magick.Quality = ThumbQuality;
                 magick.Format = MagickFormat.Jpeg;
+                // 去除 EXIF/GPS 等元数据，避免缩略图泄露拍摄位置等隐私
+                magick.Strip();
                 await magick.WriteAsync(cacheFile, ct);
             }
+            return null;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "生成缩略图失败: {Name} (size={Size})", image.StoredName, size);
+            _logger.LogWarning(ex, "生成缩略图失败: {Source} (width={Width})", Path.GetFileName(sourcePath), targetWidth);
             try { System.IO.File.WriteAllText(failMark, ex.Message); } catch { /* ignore */ }
-            return StatusCode(StatusCodes.Status500InternalServerError, new { error = $"生成预览失败：{ex.Message}" });
+            return $"生成预览失败：{ex.Message}";
         }
-
-        return PhysicalFile(cacheFile, "image/jpeg", true);
     }
 
     /// <summary>获取原图：点击"查看原图 / 下载原图"时才调用，以二进制流形式返回原始文件（支持 Range 断点续传）。
-    /// 注意：静态 /uploads 目录已不再对外公开，原图只能通过该接口按 ID 按需获取。
+    /// 注意：静态 /uploads 目录已不再对外公开，原图只能通过该接口按 publicId 按需获取。
+    /// publicId 为不可预测的随机标识（StoredName 的 GUID 部分），无法被枚举遍历下载全部原图。
     /// </summary>
-    [HttpGet("{id:int}/raw")]
-    public async Task<IActionResult> Raw(int id, CancellationToken ct)
+    [HttpGet("{publicId}/raw")]
+    public async Task<IActionResult> Raw(string publicId, CancellationToken ct)
     {
-        var image = await _db.Images.FindAsync(new object[] { id }, ct);
+        var image = await _db.Images.FirstOrDefaultAsync(i => i.StoredName == publicId, ct);
         if (image is null) return NotFound(new { error = "图片不存在" });
 
         var sourcePath = Path.Combine(_uploadsDir, image.StoredName);
@@ -379,6 +432,12 @@ public class ImagesController : ControllerBase
         Response.Headers.ContentDisposition = cd.ToString();
         return PhysicalFile(sourcePath, contentType, true);
     }
+
+    /// <summary>校验 uploadId：仅允许字母/数字/连字符（前端用 UUID 生成），防止路径穿越</summary>
+    private static bool IsValidUploadId(string? uploadId)
+        => !string.IsNullOrEmpty(uploadId)
+           && uploadId.Length <= 64
+           && uploadId.All(c => char.IsAsciiLetterOrDigit(c) || c == '-');
 
     /// <summary>按扩展名映射 MIME Content-Type，PhysicalFile 返回时写正确的响应头</summary>
     private static string? MimeContentType(string ext)
@@ -498,7 +557,7 @@ public class ImagesController : ControllerBase
         }
 
         await _db.SaveChangesAsync();
-        return Ok(new ImageDto(image.Id, image.FileName, image.FileSize, image.ContentType, image.Category, image.UploadedAt));
+        return Ok(new ImageDto(image.Id, image.FileName, image.FileSize, image.ContentType, image.Category, image.UploadedAt, image.StoredName));
     }
 
     /// <summary>批量修改分类</summary>
@@ -555,6 +614,8 @@ public class ImagesController : ControllerBase
             foreach (var v in profile.Values)
             {
                 var key = v.Tag.ToString();
+                // 过滤 GPS 相关标签，避免泄露拍摄位置
+                if (key.StartsWith("GPS", StringComparison.OrdinalIgnoreCase)) continue;
                 var val = v.ToString();
                 if (!string.IsNullOrEmpty(val))
                     result[key] = val;
@@ -593,7 +654,7 @@ public class ImagesController : ControllerBase
     }
 }
 
-public record ImageDto(int Id, string FileName, long FileSize, string ContentType, string Category, DateTime UploadedAt);
+public record ImageDto(int Id, string FileName, long FileSize, string ContentType, string Category, DateTime UploadedAt, string PublicId);
 public record BatchDeleteRequest(List<int> Ids);
 public record UpdateImageRequest(string? Category, string? FileName);
 public record BatchUpdateRequest(List<int> Ids, string Category);

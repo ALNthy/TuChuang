@@ -29,9 +29,9 @@ function formatDate(s: string): string {
   return new Date(s).toLocaleString('zh-CN')
 }
 
-async function copyUrl(id: number, fileName: string) {
-  // 原图只通过 /api/images/{id}/raw 暴露，列表不再带真实静态 URL
-  const full = `${window.location.origin}/api/images/${id}/raw`
+async function copyUrl(publicId: string, fileName: string) {
+  // 原图通过不可预测的 publicId 暴露，避免自增 id 被遍历下载
+  const full = `${window.location.origin}/api/images/${publicId}/raw`
   try {
     await navigator.clipboard.writeText(full)
     if (fileName) void fileName
@@ -57,7 +57,7 @@ function thumbSrc(img: ImageDto): string {
 }
 
 /** Lightbox 展示图 src（"点击查看原图"之后才去拉）：
- *  - 通用可渲染格式：`/api/images/{id}/raw` 返回原图字节流（inline + 正确 MIME，可直接渲染或下载）
+ *  - 通用可渲染格式：`/api/images/{publicId}/raw` 返回原图字节流（inline + 正确 MIME，可直接渲染或下载）
  *  - RAW/ARW：浏览器不能直接渲染 RAW 二进制，走 `?size=medium` 拿 1600px JPEG 预览
  *    （顶部"下载原图"按钮还是走 raw 接口，把源 RAW 文件下载给用户）
  */
@@ -65,7 +65,7 @@ function viewerSrc(img: ImageDto): string {
   if (RAW_EXTS.has(ext(img.fileName))) {
     return `/api/images/${img.id}/preview?size=medium`
   }
-  return `/api/images/${img.id}/raw`
+  return `/api/images/${img.publicId}/raw`
 }
 
 function isRaw(img: ImageDto): boolean {
@@ -75,10 +75,6 @@ function isRaw(img: ImageDto): boolean {
 function extLabel(filename: string): string {
   const e = ext(filename)
   return e ? e.slice(1).toUpperCase() : 'FILE'
-}
-
-function fullRawUrl(id: number): string {
-  return `${window.location.origin}/api/images/${id}/raw`
 }
 
 // ================================================================================
@@ -831,10 +827,10 @@ watch(
         </div>
         <div class="v-actions">
           <button class="v-btn" :class="{ active: showExif }" title="查看 EXIF 元数据" @click="toggleExifPanel">EXIF</button>
-          <button class="v-btn" @click="copyUrl(currentImage.id, currentImage.fileName)">复制链接</button>
+          <button class="v-btn" @click="copyUrl(currentImage.publicId, currentImage.fileName)">复制链接</button>
           <a
             class="v-btn primary"
-            :href="`/api/images/${currentImage.id}/raw`"
+            :href="`/api/images/${currentImage.publicId}/raw`"
             :download="currentImage.fileName"
             :title="isRaw(currentImage) ? 'RAW/ARW 浏览器无法直接渲染，下载源文件查看' : '下载原图二进制源文件'"
             >{{ isRaw(currentImage) ? '下载源文件' : '下载原图' }}</a
@@ -887,7 +883,7 @@ watch(
                   : '原图加载失败，请稍后重试或下载本地'
               }}
             </p>
-            <a class="v-btn primary" :href="`/api/images/${currentImage.id}/raw`" :download="currentImage.fileName"
+            <a class="v-btn primary" :href="`/api/images/${currentImage.publicId}/raw`" :download="currentImage.fileName"
               >下载源文件</a
             >
           </div>

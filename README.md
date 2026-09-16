@@ -37,7 +37,7 @@
 
 ### 安全
 - **JWT 鉴权**：写操作（上传/删除/编辑）需登录，密钥从环境变量读取
-- **原图不直接暴露**：`/uploads` 静态目录关闭，必须通过 `/api/images/{id}/raw` 按 ID 获取
+- **原图不直接暴露**：`/uploads` 静态目录关闭，必须通过 `/api/images/{publicId}/raw` 按不可预测的随机标识获取（`publicId` 为 StoredName 的 GUID 部分，无法遍历下载）
 - **文件名安全化**：`Path.GetFileName` 去除路径分隔符
 - **文件类型白名单**：后端校验扩展名
 
@@ -174,7 +174,7 @@ tuchuang/
 | POST | `/api/images/upload-chunk` | ✅ | 分片上传：接收单个分片 |
 | POST | `/api/images/merge` | ✅ | 分片上传：合并所有分片 |
 | GET | `/api/images/{id}/preview` | - | 获取缩略图（480px / 1600px） |
-| GET | `/api/images/{id}/raw` | - | 获取原图（点击查看原图时调用） |
+| GET | `/api/images/{publicId}/raw` | - | 获取原图（点击查看原图时调用，publicId 为随机标识） |
 | GET | `/api/images/{id}/exif` | - | 获取 EXIF 信息 |
 | PATCH | `/api/images/{id}` | ✅ | 修改图片分类 / 文件名 |
 | PATCH | `/api/images/batch` | ✅ | 批量改分类 |

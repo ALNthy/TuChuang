@@ -24,6 +24,8 @@ if (signingKeyStr.Length < 32)
     throw new InvalidOperationException(
         $"Jwt:SigningKey 长度不足（当前 {signingKeyStr.Length} 字符），至少需要 32 字符以保证安全。" +
         "请设置环境变量 JWT_SIGNING_KEY 为一段足够长的随机字符串。");
+// 回写配置，保证 AccountController 签发 token 与这里的验证使用同一把密钥
+builder.Configuration["Jwt:SigningKey"] = signingKeyStr;
 var signingKey = Encoding.UTF8.GetBytes(signingKeyStr);
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(opt =>
@@ -42,15 +44,17 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     });
 builder.Services.AddAuthorization();
 
-// 允许前端开发服务器跨域访问
+// 跨域白名单：仅允许配置的来源（默认本地开发前端）；
+// 生产环境用环境变量 Cors__AllowedOrigins__0 / __1 ... 覆盖。Docker 下同源反代，无需跨域
 var corsPolicy = "DevCors";
+var corsOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
+    ?? new[] { "http://localhost:5173", "http://127.0.0.1:5173" };
 builder.Services.AddCors(o =>
 {
     o.AddPolicy(corsPolicy, p => p
-        .SetIsOriginAllowed(_ => true)
+        .WithOrigins(corsOrigins)
         .AllowAnyHeader()
-        .AllowAnyMethod()
-        .AllowCredentials());
+        .AllowAnyMethod());
 });
 
 var app = builder.Build();
@@ -76,6 +80,24 @@ Directory.CreateDirectory(uploadsDir);
 // 启动时清理预览缓存：删除超过 30 天未修改的缓存文件（含 .fail 负缓存标记）
 // 缓存按需重新生成，删除不影响功能；定期清理避免长期累积占空间
 CleanupPreviewCache(uploadsDir, maxAgeDays: 30, app.Logger);
+
+// 启动时清理遗留的分片上传临时目录（上传中断/进程退出残留）
+CleanupTempSessions(uploadsDir, maxAgeHours: 24, app.Logger);
+
+// 全局异常处理：捕获未处理异常，记录日志并返回统一 JSON，避免生产环境空 500
+app.UseExceptionHandler(errApp => errApp.Run(async ctx =>
+{
+    var feature = ctx.Features.Get<Microsoft.AspNetCore.Diagnostics.IExceptionHandlerFeature>();
+    var ex = feature?.Error;
+    if (ex is not null)
+    {
+        ctx.RequestServices.GetRequiredService<ILogger<Program>>()
+            .LogError(ex, "未处理的异常: {Method} {Path}", ctx.Request.Method, ctx.Request.Path);
+    }
+    ctx.Response.StatusCode = StatusCodes.Status500InternalServerError;
+    ctx.Response.ContentType = "application/json; charset=utf-8";
+    await ctx.Response.WriteAsync("{\"error\":\"服务器内部错误\"}");
+}));
 
 app.UseCors(corsPolicy);
 app.UseStaticFiles();
@@ -137,5 +159,45 @@ static void CleanupPreviewCache(string uploadsDir, int maxAgeDays, ILogger logge
     if (deleted > 0)
     {
         logger.LogInformation("已清理 {Count} 个超期预览缓存文件（{Bytes:N0} 字节）", deleted, freedBytes);
+    }
+}
+
+// ================================================================================
+// 分片临时目录清理：应用启动时调用一次
+// 扫描 uploads/temp/，删除 mtime 超过 maxAgeHours 小时的会话目录（含其中残留分片）
+// 正常流程会在 merge 时清理，这里兜底处理上传中断/进程异常的残留
+// ================================================================================
+static void CleanupTempSessions(string uploadsDir, int maxAgeHours, ILogger logger)
+{
+    var tempDir = Path.Combine(uploadsDir, "temp");
+    if (!Directory.Exists(tempDir)) return;
+
+    var cutoff = DateTime.UtcNow.AddHours(-maxAgeHours);
+    var deleted = 0;
+    long freedBytes = 0;
+    foreach (var dir in Directory.EnumerateDirectories(tempDir))
+    {
+        try
+        {
+            if (Directory.GetLastWriteTimeUtc(dir) < cutoff)
+            {
+                try
+                {
+                    foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+                        freedBytes += new FileInfo(f).Length;
+                }
+                catch { /* 统计大小失败不阻断删除 */ }
+                Directory.Delete(dir, true);
+                deleted++;
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "清理分片临时目录失败: {Dir}", dir);
+        }
+    }
+    if (deleted > 0)
+    {
+        logger.LogInformation("已清理 {Count} 个过期分片临时目录（{Bytes:N0} 字节）", deleted, freedBytes);
     }
 }

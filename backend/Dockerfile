@@ -15,11 +15,13 @@ FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
 WORKDIR /app
 
 # Magick.NET 在 Linux 上需要 libgdiplus 解码图像（RAW/ARW 转 JPEG 预览）
+# curl 供 docker-compose 健康检查使用（基础镜像默认不含 curl）
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libgdiplus \
         libc6-dev \
         ca-certificates \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/publish ./

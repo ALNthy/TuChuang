@@ -5,6 +5,8 @@ export interface ImageDto {
   contentType: string
   category: string
   uploadedAt: string
+  /** 原图访问用的不可预测随机标识（对应后端 StoredName），替代自增 id 防止遍历下载 */
+  publicId: string
 }
 
 export interface Category {
